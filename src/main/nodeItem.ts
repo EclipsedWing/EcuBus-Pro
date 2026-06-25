@@ -8,8 +8,7 @@ import UdsTester, {
   linApiStartSch,
   linApiStopSch,
   pwmApiSetDuty,
-  SerialPortManager,
-  SerialPortApi,
+  SerialApi,
   SomeipApiCall
 } from './workerClient'
 import { CAN_TP, CAN_TP_SOCKET, TpError as CanTpError } from './docan/cantp'
@@ -31,6 +30,8 @@ import logo from './logo.html?raw'
 import fsP from 'fs/promises'
 import type { TestEvent } from 'node:test/reporters'
 import { PwmBase } from './pwm'
+import { SerialBase } from './serial'
+import { SerialMessage } from './share/serial'
 import { setSignal } from './util'
 import { VSomeIP_Client } from './vsomeip'
 import { SomeipMessage, SomeipMessageType, VsomeipAvailabilityInfo } from './share/someip'
@@ -85,9 +86,10 @@ export class NodeClass {
   private canBaseId: string[] = []
   private ethBaseId: string[] = []
   private pwmBaseId: string[] = []
+  private serialBaseId: string[] = []
   private someipBaseId: string[] = []
   private startTs = 0
-  private boundCb: (frame: CanMessage | LinMsg | SomeipMessage) => void
+  private boundCb: (frame: CanMessage | LinMsg | SomeipMessage | SerialMessage) => void
   private boundSomeipServiceValidCb: (info: VsomeipAvailabilityInfo) => void
   private udsTesterMap = new Map<string, UDSTesterMain>()
   private canBaseMap: Map<string, CanBase> = new Map()
@@ -95,9 +97,9 @@ export class NodeClass {
   private doips: DOIP[] = []
   private ethBaseMap: Map<string, EthBaseInfo> = new Map()
   private pwmBaseMap: Map<string, PwmBase> = new Map()
+  private serialBaseMap: Map<string, SerialBase> = new Map()
   private someipMap: Map<string, VSomeIP_Client> = new Map()
   private testers: Record<string, TesterInfo> = {}
-  private serialPortManager?: SerialPortManager
   freeEvent: {
     doip: DOIP
     id: string
@@ -180,6 +182,7 @@ export class NodeClass {
     ethBaseMap: Map<string, EthBaseInfo>,
     pwmBaseMap: Map<string, PwmBase>,
     someipMap: Map<string, VSomeIP_Client>,
+    serialBaseMap: Map<string, SerialBase>,
     testers: Record<string, TesterInfo>
   ) {
     this.canBaseMap = canBaseMap
@@ -187,6 +190,7 @@ export class NodeClass {
     this.doips = doips
     this.ethBaseMap = ethBaseMap
     this.pwmBaseMap = pwmBaseMap
+    this.serialBaseMap = serialBaseMap
     this.someipMap = someipMap
     this.testers = testers
     this.pool?.buildServiceMap(testers)
@@ -217,6 +221,11 @@ export class NodeClass {
       if (pwmBaseItem) {
         this.pwmBaseId.push(c)
       }
+      const serialBaseItem = this.serialBaseMap.get(c)
+      if (serialBaseItem) {
+        this.serialBaseId.push(c)
+        serialBaseItem.attachSerialMessage(this.boundCb)
+      }
       const someipBaseItem = this.someipMap.get(c)
       if (someipBaseItem) {
         this.someipBaseId.push(c)
@@ -234,9 +243,7 @@ export class NodeClass {
       this.pool.registerHandler('canApi', this.canApi.bind(this))
       this.pool.registerHandler('stopUdsSeq', this.stopUdsSeq.bind(this))
       this.pool.registerHandler('pwmApi', this.pwmApi.bind(this))
-      // SerialPort API
-      this.serialPortManager = new SerialPortManager(this.pool)
-      this.pool.registerHandler('serialPortApi', this.serialPortApi.bind(this))
+      this.pool.registerHandler('serialApi', this.serialApi.bind(this))
       this.pool.registerHandler('someipApi', this.someipApi.bind(this))
 
       //cantp
@@ -869,11 +876,30 @@ export class NodeClass {
     }
   }
 
-  async serialPortApi(data: SerialPortApi): Promise<any> {
-    if (!this.serialPortManager) {
-      throw new Error('SerialPortManager not initialized')
+  async serialApi(data: SerialApi): Promise<number> {
+    const findSerialBase = (name?: string) => {
+      let ret: SerialBase | undefined
+      if (name != undefined) {
+        for (const channelId of this.serialBaseId) {
+          const item = this.serialBaseMap.get(channelId)
+          if (item && item.info.name == name) {
+            ret = item
+            break
+          }
+        }
+      } else if (this.serialBaseId.length > 0) {
+        ret = this.serialBaseMap.get(this.serialBaseId[0])
+      }
+      if (ret == undefined) {
+        throw new Error(`serial device ${name ?? ''} not found`)
+      }
+      return ret
     }
-    return this.serialPortManager.handleApi(data)
+    const serialBase = findSerialBase(data.device)
+    if (data.method == 'write') {
+      return serialBase.write(Buffer.from(data.data), this.nodeItem.id)
+    }
+    throw new Error(`Unknown serialApi method`)
   }
 
   async linApi(
@@ -1491,6 +1517,10 @@ export class NodeClass {
         someipBaseItem.detachSomeipMessage(this.boundCb)
         someipBaseItem.detachSomeipServiceValid(this.boundSomeipServiceValidCb)
       }
+      const serialBaseItem = this.serialBaseMap.get(c)
+      if (serialBaseItem) {
+        serialBaseItem.detachSerialMessage(this.boundCb)
+      }
     }
     for (const e of this.freeEvent) {
       e.doip.event.removeListener(e.id, e.cb)
@@ -1508,14 +1538,6 @@ export class NodeClass {
       tp.close(false)
     })
     this.lintp.length = 0 // 清空数组
-
-    // 清理 SerialPort
-    if (this.serialPortManager) {
-      this.serialPortManager.closeAll().catch(() => {
-        // ignore errors during cleanup
-      })
-      this.serialPortManager = undefined
-    }
 
     // 清理 UdsTester 事件处理器
     if (this.pool) {
@@ -1560,13 +1582,18 @@ export class NodeClass {
     const res = await this.pool?.setTxPending(msg)
     return res ? Buffer.from(res) : undefined
   }
-  cb(frame: CanMessage | LinMsg | SomeipMessage) {
+  cb(frame: CanMessage | LinMsg | SomeipMessage | SerialMessage) {
     const reportAsyncError = (e: any) => {
       this.log?.scriptMsg(e.toString(), getTsUs(), 'error')
     }
     if ('msgType' in frame) {
       if (frame.msgType.uuid != this.nodeItem.id) {
         void this.pool?.triggerCanFrame(frame).catch(reportAsyncError)
+      }
+    } else if ('dir' in frame) {
+      // SerialMessage: don't echo a node's own outgoing frame back to itself
+      if (!(frame.dir == 'OUT' && frame.uuid == this.nodeItem.id)) {
+        void this.pool?.triggerSerialFrame(frame).catch(reportAsyncError)
       }
     } else if ('instance' in frame) {
       void this.pool?.triggerSomeipFrame(frame).catch(reportAsyncError)
