@@ -527,17 +527,12 @@ export class VectorLin extends LinBase {
           //设备通道循环索引
           const channel = channles.getitem(num) //通道数组索引
           const channelName = channel.name.replace(/\0/g, '') //通道名称
-          let busType = ''
 
-          if (channel.transceiverName.indexOf('LIN') !== -1) {
-            busType = '#LIN' //总线类型
-          } else if (channel.name.indexOf('Virtual') !== -1) {
-            busType = ''
-            continue
-          } else {
-            busType = '#CAN' //LIN版本不要添加CAN
+          if (channel.busParams.busType !== 2) {
             continue
           }
+
+          const busType = '#LIN'
 
           devices.push({
             label: `${channelName}${busType}`, //'VN1640A Channel 1#LIN' = 通道名称#总线类型
